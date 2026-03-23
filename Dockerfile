@@ -9,5 +9,6 @@ ENV NODE_ENV=production
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json ./
 COPY server.js ./
+COPY scripts/redis-demo-counter.js ./scripts/redis-demo-counter.js
 EXPOSE 3000
 CMD ["node", "server.js"]
