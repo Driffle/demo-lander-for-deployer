@@ -14,6 +14,10 @@ import {
 } from "@aws-sdk/client-s3";
 
 const app = express();
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+  next();
+});
 app.use(express.json());
 const port = Number(process.env.PORT) || 3000;
 
