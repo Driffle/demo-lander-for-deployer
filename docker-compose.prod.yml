@@ -71,6 +71,7 @@ services:
       S3_SECRET_ACCESS_KEY: minioadmin
       S3_BUCKET: demo-uploads
       S3_REGION: us-east-1
+      ENV_CUSTOM: "Hello World"
     depends_on:
       db:
         condition: service_healthy

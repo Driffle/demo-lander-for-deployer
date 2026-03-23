@@ -53,6 +53,10 @@ function getRedisUrl() {
   return process.env.REDIS_URL || null;
 }
 
+function getEnvCustom() {
+  return process.env.ENV_CUSTOM ?? null;
+}
+
 /** Namespace keys when sharing a Redis instance with other apps (optional). */
 function getRedisKeyPrefix() {
   const p = (process.env.REDIS_KEY_PREFIX || "").trim();
@@ -490,6 +494,8 @@ app.get("/", async (_req, res) => {
   const redisKeyEffective = redisUrl ? redisKey(DEMO_TEST_LOGICAL_KEY) : null;
   const redisPrefixDisplay = getRedisKeyPrefix() || "(none)";
 
+  const envCustom = getEnvCustom();
+
   res.type("html").send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -527,6 +533,7 @@ app.get("/", async (_req, res) => {
     .file-table td { padding: 0.4rem 0.5rem; border-bottom: 1px solid #1c2333; }
     .file-table a { text-decoration: none; }
     .btn-del { font-size: 0.75rem; padding: 0.2rem 0.5rem; }
+    .env-custom-banner { margin: 0.75rem 0 1rem; padding: 0.75rem 1rem; background: #1c2333; border-radius: 8px; border-left: 4px solid #79c0ff; }
   </style>
 </head>
 <body>
@@ -535,6 +542,11 @@ app.get("/", async (_req, res) => {
       ? escapeHtml(String(mongoAppName))
       : "Demo lander for Deployer"
   }</h1>
+  <p class="env-custom-banner"><code>ENV_CUSTOM</code>: ${
+    envCustom !== null
+      ? `<span class="ok">${escapeHtml(envCustom)}</span>`
+      : `<span class="bad">(not set)</span>`
+  }</p>
   <p>This app is meant to be deployed with <strong>Deployer</strong>, <strong>Postgres</strong> for visits, <strong>MongoDB</strong> for the headline app name and file metadata, <strong>Redis</strong> for the <code>demo_test</code> value, <strong>MySQL</strong> for the atomic counter, and <strong>S3/MinIO</strong> for file uploads.</p>
 
   <div class="counter-box">
@@ -622,6 +634,11 @@ app.get("/", async (_req, res) => {
 
   <ul>
     <li>Compose file: <code>docker-compose.prod.yml</code></li>
+    <li><code>ENV_CUSTOM</code>: ${
+      envCustom !== null
+        ? `<span class="ok">${escapeHtml(envCustom)}</span>`
+        : `<span class="bad">(not set)</span>`
+    }</li>
     <li>App name (from MongoDB <code>app_meta</code>): ${
       mongoAppName !== null
         ? `<span class="ok">${escapeHtml(String(mongoAppName))}</span>`
