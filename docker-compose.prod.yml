@@ -13,6 +13,10 @@ services:
       timeout: 3s
       retries: 15
 
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+
   web:
     build: .
     ports:
@@ -20,9 +24,12 @@ services:
     environment:
       PORT: "3000"
       DATABASE_URL: postgresql://lander:lander@db:5432/lander
+      MONGODB_URI: mongodb://mongo:27017/demo_lander
     depends_on:
       db:
         condition: service_healthy
+      mongo:
+        condition: service_started
 
 volumes:
   pgdata:
