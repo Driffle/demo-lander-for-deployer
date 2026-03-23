@@ -30,6 +30,7 @@ services:
       DATABASE_URL: postgresql://lander:lander@db:5432/lander
       MONGODB_URI: mongodb://mongo:27017/demo_lander
       REDIS_URL: redis://redis:6379
+      REDIS_KEY_PREFIX: demo_lander
     depends_on:
       db:
         condition: service_healthy
