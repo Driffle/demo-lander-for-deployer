@@ -17,6 +17,10 @@ services:
     image: mongo:7
     restart: unless-stopped
 
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
   web:
     build: .
     ports:
@@ -25,10 +29,13 @@ services:
       PORT: "3000"
       DATABASE_URL: postgresql://lander:lander@db:5432/lander
       MONGODB_URI: mongodb://mongo:27017/demo_lander
+      REDIS_URL: redis://redis:6379
     depends_on:
       db:
         condition: service_healthy
       mongo:
+        condition: service_started
+      redis:
         condition: service_started
 
 volumes:
