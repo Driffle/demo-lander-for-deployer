@@ -1,12 +1,23 @@
 import express from "express";
-import { MongoClient } from "mongodb";
+import { MongoClient, ObjectId } from "mongodb";
+import multer from "multer";
 import mysql from "mysql2/promise";
 import pg from "pg";
 import { createClient } from "redis";
+import {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+  DeleteObjectCommand,
+  HeadBucketCommand,
+  CreateBucketCommand,
+} from "@aws-sdk/client-s3";
 
 const app = express();
 app.use(express.json());
 const port = Number(process.env.PORT) || 3000;
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 const APP_META_ID = "singleton";
 const DEMO_TEST_LOGICAL_KEY = "demo_test";
@@ -25,6 +36,10 @@ let redisInitError = null;
 
 let mysqlPool = null;
 let mysqlInitError = null;
+
+let s3Client = null;
+let s3Bucket = null;
+let s3InitError = null;
 
 function getDatabaseUrl() {
   return process.env.DATABASE_URL || null;
@@ -244,15 +259,65 @@ async function resetCounter() {
   }
 }
 
+function getS3Config() {
+  const accessKey = process.env.S3_ACCESS_KEY_ID || null;
+  const secretKey = process.env.S3_SECRET_ACCESS_KEY || null;
+  if (!accessKey || !secretKey) return null;
+  return {
+    endpoint: process.env.S3_ENDPOINT || null,
+    accessKeyId: accessKey,
+    secretAccessKey: secretKey,
+    bucket: process.env.S3_BUCKET || "demo-uploads",
+    region: process.env.S3_REGION || "us-east-1",
+  };
+}
+
+async function initS3() {
+  const cfg = getS3Config();
+  if (!cfg) {
+    s3InitError =
+      "S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY not set (enable MinIO backend in Deployer or set S3 env vars).";
+    return;
+  }
+  try {
+    const opts = {
+      region: cfg.region,
+      credentials: { accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey },
+    };
+    if (cfg.endpoint) {
+      opts.endpoint = cfg.endpoint;
+      opts.forcePathStyle = true;
+    }
+    s3Client = new S3Client(opts);
+    s3Bucket = cfg.bucket;
+    try {
+      await s3Client.send(new HeadBucketCommand({ Bucket: s3Bucket }));
+    } catch (e) {
+      if (e.name === "NotFound" || e.$metadata?.httpStatusCode === 404) {
+        await s3Client.send(new CreateBucketCommand({ Bucket: s3Bucket }));
+      } else {
+        throw e;
+      }
+    }
+    s3InitError = null;
+  } catch (e) {
+    s3InitError = String(e?.message || e);
+    s3Client = null;
+    s3Bucket = null;
+  }
+}
+
 function healthOk() {
   const pgNeeded = Boolean(getDatabaseUrl());
   const mongoNeeded = Boolean(getMongoUri());
   const redisNeeded = Boolean(getRedisUrl());
   const mysqlNeeded = Boolean(getMysqlConfig());
+  const s3Needed = Boolean(getS3Config());
   if (pgNeeded && dbError) return false;
   if (mongoNeeded && mongoInitError) return false;
   if (redisNeeded && redisInitError) return false;
   if (mysqlNeeded && mysqlInitError) return false;
+  if (s3Needed && s3InitError) return false;
   return true;
 }
 
@@ -282,6 +347,78 @@ app.post("/api/counter/reset", async (_req, res) => {
   const { value, error } = await resetCounter();
   if (error) return res.status(503).json({ error });
   res.json({ value });
+});
+
+app.post("/api/files/upload", upload.single("file"), async (req, res) => {
+  if (!s3Client || !s3Bucket) return res.status(503).json({ error: s3InitError || "S3 not connected" });
+  if (!mongoDb) return res.status(503).json({ error: mongoInitError || "MongoDB not connected" });
+  if (!req.file) return res.status(400).json({ error: "No file provided" });
+  const file = req.file;
+  const s3Key = `uploads/${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+  try {
+    await s3Client.send(new PutObjectCommand({
+      Bucket: s3Bucket,
+      Key: s3Key,
+      Body: file.buffer,
+      ContentType: file.mimetype,
+    }));
+    const doc = {
+      originalName: file.originalname,
+      s3Key,
+      size: file.size,
+      contentType: file.mimetype,
+      uploadedAt: new Date(),
+    };
+    const result = await mongoDb.collection("uploads").insertOne(doc);
+    res.json({ ...doc, _id: result.insertedId });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+app.get("/api/files", async (_req, res) => {
+  if (!mongoDb) return res.status(503).json({ error: mongoInitError || "MongoDB not connected" });
+  try {
+    const files = await mongoDb.collection("uploads").find().sort({ uploadedAt: -1 }).toArray();
+    res.json(files);
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+app.get("/api/files/:id/download", async (req, res) => {
+  if (!s3Client || !s3Bucket) return res.status(503).json({ error: s3InitError || "S3 not connected" });
+  if (!mongoDb) return res.status(503).json({ error: mongoInitError || "MongoDB not connected" });
+  try {
+    const doc = await mongoDb.collection("uploads").findOne({ _id: new ObjectId(req.params.id) });
+    if (!doc) return res.status(404).json({ error: "File not found" });
+    const obj = await s3Client.send(new GetObjectCommand({ Bucket: s3Bucket, Key: doc.s3Key }));
+    res.set("Content-Type", doc.contentType || "application/octet-stream");
+    res.set("Content-Disposition", `attachment; filename="${encodeURIComponent(doc.originalName)}"`);
+    obj.Body.transformToWebStream().pipeTo(
+      new WritableStream({
+        write(chunk) { res.write(chunk); },
+        close() { res.end(); },
+        abort(err) { res.destroy(err); },
+      }),
+    );
+  } catch (e) {
+    if (!res.headersSent) res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+app.delete("/api/files/:id", async (req, res) => {
+  if (!s3Client || !s3Bucket) return res.status(503).json({ error: s3InitError || "S3 not connected" });
+  if (!mongoDb) return res.status(503).json({ error: mongoInitError || "MongoDB not connected" });
+  try {
+    const doc = await mongoDb.collection("uploads").findOne({ _id: new ObjectId(req.params.id) });
+    if (!doc) return res.status(404).json({ error: "File not found" });
+    await s3Client.send(new DeleteObjectCommand({ Bucket: s3Bucket, Key: doc.s3Key }));
+    await mongoDb.collection("uploads").deleteOne({ _id: doc._id });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
 });
 
 app.get("/", async (_req, res) => {
@@ -331,6 +468,11 @@ app.get("/", async (_req, res) => {
     ? `mysql://${mysqlCfg.user}:****@${mysqlCfg.host}:${mysqlCfg.port}/${mysqlCfg.database}`
     : "(not set)";
 
+  const s3Cfg = getS3Config();
+  const s3EndpointDisplay = s3Cfg
+    ? (s3Cfg.endpoint || "AWS S3 (default)") + " / bucket: " + (s3Bucket || s3Cfg.bucket)
+    : "(not set)";
+
   const url = getDatabaseUrl();
   const masked = url
     ? url.replace(/:([^:@/]+)@/, ":****@")
@@ -353,7 +495,7 @@ app.get("/", async (_req, res) => {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Demo lander — Deployer + Postgres + MongoDB + Redis + MySQL</title>
+  <title>Demo lander — Deployer + Postgres + MongoDB + Redis + MySQL + S3</title>
   <style>
     :root { font-family: system-ui, sans-serif; background: #0f1419; color: #e7ecf3; }
     body { max-width: 42rem; margin: 3rem auto; padding: 0 1.25rem; line-height: 1.5; }
@@ -366,15 +508,25 @@ app.get("/", async (_req, res) => {
     .counter-box { margin: 1.5rem 0; padding: 1.25rem; background: #1c2333; border-radius: 8px; text-align: center; }
     .counter-value { font-size: 2.5rem; font-weight: 700; font-variant-numeric: tabular-nums; margin: 0.5rem 0; }
     .counter-buttons { display: flex; gap: 0.5rem; justify-content: center; margin-top: 0.75rem; }
-    .counter-buttons button {
+    .counter-buttons button, .upload-box button {
       font-size: 0.9rem; font-weight: 600; padding: 0.4rem 1rem; border: none;
       border-radius: 6px; cursor: pointer; transition: opacity 0.15s;
     }
-    .counter-buttons button:hover { opacity: 0.85; }
-    .counter-buttons button:disabled { opacity: 0.4; cursor: not-allowed; }
-    .btn-inc { background: #238636; color: #fff; }
-    .btn-dec { background: #da3633; color: #fff; }
+    .counter-buttons button:hover, .upload-box button:hover { opacity: 0.85; }
+    .counter-buttons button:disabled, .upload-box button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-inc, .btn-upload { background: #238636; color: #fff; }
+    .btn-dec, .btn-del { background: #da3633; color: #fff; }
     .btn-reset { background: #30363d; color: #c9d1d9; }
+    .upload-box { margin: 1.5rem 0; padding: 1.25rem; background: #1c2333; border-radius: 8px; }
+    .upload-box h2 { font-size: 1rem; font-weight: 600; margin: 0 0 0.75rem; }
+    .upload-form { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+    .upload-form input[type="file"] { flex: 1; min-width: 0; font-size: 0.85rem; color: #c9d1d9; }
+    .upload-status { font-size: 0.8rem; margin-top: 0.5rem; min-height: 1.2em; }
+    .file-table { width: 100%; border-collapse: collapse; margin-top: 0.75rem; font-size: 0.85rem; }
+    .file-table th { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid #30363d; opacity: 0.7; font-weight: 500; }
+    .file-table td { padding: 0.4rem 0.5rem; border-bottom: 1px solid #1c2333; }
+    .file-table a { text-decoration: none; }
+    .btn-del { font-size: 0.75rem; padding: 0.2rem 0.5rem; }
   </style>
 </head>
 <body>
@@ -383,7 +535,7 @@ app.get("/", async (_req, res) => {
       ? escapeHtml(String(mongoAppName))
       : "Demo lander for Deployer"
   }</h1>
-  <p>This app is meant to be deployed with <strong>Deployer</strong>, <strong>Postgres</strong> for visits, <strong>MongoDB</strong> for the headline app name, <strong>Redis</strong> for the <code>demo_test</code> value, and <strong>MySQL</strong> for the atomic counter.</p>
+  <p>This app is meant to be deployed with <strong>Deployer</strong>, <strong>Postgres</strong> for visits, <strong>MongoDB</strong> for the headline app name and file metadata, <strong>Redis</strong> for the <code>demo_test</code> value, <strong>MySQL</strong> for the atomic counter, and <strong>S3/MinIO</strong> for file uploads.</p>
 
   <div class="counter-box">
     <div style="font-size:0.85rem;opacity:0.7;text-transform:uppercase;letter-spacing:0.05em">Atomic Counter <span style="opacity:0.5">(MySQL)</span></div>
@@ -410,6 +562,64 @@ app.get("/", async (_req, res) => {
     }
   </script>
 
+  <div class="upload-box">
+    <h2>File Uploads <span style="opacity:0.5">(S3/MinIO + MongoDB)</span></h2>
+    ${s3Client && mongoDb ? `
+    <div class="upload-form">
+      <input type="file" id="file-input" />
+      <button class="btn-upload" onclick="uploadFile()">Upload</button>
+    </div>
+    <div class="upload-status" id="upload-status"></div>
+    <table class="file-table">
+      <thead><tr><th>Name</th><th>Size</th><th>Uploaded</th><th></th></tr></thead>
+      <tbody id="file-list"><tr><td colspan="4" style="opacity:0.5">Loading...</td></tr></tbody>
+    </table>
+    <script>
+      function fmtSize(b) {
+        if (b < 1024) return b + ' B';
+        if (b < 1024*1024) return (b/1024).toFixed(1) + ' KB';
+        return (b/1024/1024).toFixed(1) + ' MB';
+      }
+      function fmtDate(d) { return new Date(d).toLocaleString(); }
+      async function loadFiles() {
+        try {
+          const r = await fetch('/api/files');
+          const files = await r.json();
+          const tb = document.getElementById('file-list');
+          if (!files.length) { tb.innerHTML = '<tr><td colspan="4" style="opacity:0.5">No files uploaded yet</td></tr>'; return; }
+          tb.innerHTML = files.map(f => '<tr>'
+            + '<td><a href="/api/files/' + f._id + '/download">' + esc(f.originalName) + '</a></td>'
+            + '<td>' + fmtSize(f.size) + '</td>'
+            + '<td>' + fmtDate(f.uploadedAt) + '</td>'
+            + '<td><button class="btn-del" onclick="deleteFile(\\'' + f._id + '\\')">Delete</button></td>'
+            + '</tr>').join('');
+        } catch(e) { console.error(e); }
+      }
+      function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+      async function uploadFile() {
+        const inp = document.getElementById('file-input');
+        const st = document.getElementById('upload-status');
+        if (!inp.files.length) { st.textContent = 'Select a file first'; st.className = 'upload-status bad'; return; }
+        st.textContent = 'Uploading...'; st.className = 'upload-status';
+        const fd = new FormData(); fd.append('file', inp.files[0]);
+        try {
+          const r = await fetch('/api/files/upload', { method: 'POST', body: fd });
+          const d = await r.json();
+          if (d.error) { st.textContent = d.error; st.className = 'upload-status bad'; }
+          else { st.textContent = 'Uploaded ' + d.originalName; st.className = 'upload-status ok'; inp.value = ''; loadFiles(); }
+        } catch(e) { st.textContent = String(e); st.className = 'upload-status bad'; }
+      }
+      async function deleteFile(id) {
+        try {
+          await fetch('/api/files/' + id, { method: 'DELETE' });
+          loadFiles();
+        } catch(e) { console.error(e); }
+      }
+      loadFiles();
+    </script>
+    ` : `<p class="bad">${escapeHtml(s3InitError || mongoInitError || "S3 or MongoDB not connected")}</p>`}
+  </div>
+
   <ul>
     <li>Compose file: <code>docker-compose.prod.yml</code></li>
     <li>App name (from MongoDB <code>app_meta</code>): ${
@@ -422,6 +632,11 @@ app.get("/", async (_req, res) => {
     <li>Redis URL (masked): <code>${escapeHtml(redisMasked)}</code></li>
     <li><code>REDIS_KEY_PREFIX</code>: <code>${escapeHtml(redisPrefixDisplay)}</code></li>
     <li>MySQL (masked): <code>${escapeHtml(mysqlMasked)}</code></li>
+    <li>S3/MinIO: ${
+      s3Client
+        ? `<span class="ok">${escapeHtml(s3EndpointDisplay)}</span>`
+        : `<span class="bad">${escapeHtml(s3InitError || "not connected")}</span>`
+    }</li>
     <li>Redis key <code>${escapeHtml(redisKeyEffective ?? DEMO_TEST_LOGICAL_KEY)}</code> (no TTL, set at startup): ${
       demoTestRaw !== null
         ? `<pre class="ok">${escapeHtml(
@@ -440,7 +655,7 @@ app.get("/", async (_req, res) => {
         : `<span class="bad">${counterError ? escapeHtml(counterError) : "not connected"}</span>`
     }</li>
   </ul>
-  <p>Each page load inserts a row into <code>visits</code>; refresh to see the count increase when Postgres is healthy. The headline reads <code>appName</code> from MongoDB (seeded on first connect; override with <code>APP_NAME</code> or edit the document). Use the counter buttons above to test atomic MySQL operations.</p>
+  <p>Each page load inserts a row into <code>visits</code>; refresh to see the count increase when Postgres is healthy. The headline reads <code>appName</code> from MongoDB (seeded on first connect; override with <code>APP_NAME</code> or edit the document). Use the counter buttons to test atomic MySQL operations and the upload section to test S3/MinIO storage.</p>
   <p><a href="/health"><code>/health</code></a> — returns <code>ok</code> when every configured database or cache initialized cleanly.</p>
 </body>
 </html>`);
@@ -458,6 +673,7 @@ await initDb();
 await initMongo();
 await initRedis();
 await initMysql();
+await initS3();
 
 app.listen(port, "0.0.0.0", () => {
   console.log(`demo-lander listening on :${port}`);
