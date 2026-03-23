@@ -1,11 +1,14 @@
 import express from "express";
 import { MongoClient } from "mongodb";
 import pg from "pg";
+import { createClient } from "redis";
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
 
 const APP_META_ID = "singleton";
+const DEMO_TEST_KEY = "demo_test";
+const DEMO_TEST_JSON = '{"demo":"true"}';
 
 let pool = null;
 let dbError = null;
@@ -14,12 +17,19 @@ let mongoClient = null;
 let mongoDb = null;
 let mongoInitError = null;
 
+let redisClient = null;
+let redisInitError = null;
+
 function getDatabaseUrl() {
   return process.env.DATABASE_URL || null;
 }
 
 function getMongoUri() {
   return process.env.MONGODB_URI || null;
+}
+
+function getRedisUrl() {
+  return process.env.REDIS_URL || null;
 }
 
 async function initDb() {
@@ -97,11 +107,38 @@ async function getAppNameFromMongo() {
   }
 }
 
+async function initRedis() {
+  const url = getRedisUrl();
+  if (!url) {
+    redisInitError = null;
+    return;
+  }
+  try {
+    redisClient = createClient({ url });
+    redisClient.on("error", (err) => {
+      console.error("Redis client error:", err);
+    });
+    await redisClient.connect();
+    await redisClient.set(DEMO_TEST_KEY, DEMO_TEST_JSON);
+    redisInitError = null;
+  } catch (e) {
+    redisInitError = String(e?.message || e);
+    try {
+      if (redisClient?.isOpen) await redisClient.quit();
+    } catch {
+      /* ignore */
+    }
+    redisClient = null;
+  }
+}
+
 function healthOk() {
   const pgNeeded = Boolean(getDatabaseUrl());
   const mongoNeeded = Boolean(getMongoUri());
+  const redisNeeded = Boolean(getRedisUrl());
   if (pgNeeded && dbError) return false;
   if (mongoNeeded && mongoInitError) return false;
+  if (redisNeeded && redisInitError) return false;
   return true;
 }
 
@@ -122,6 +159,30 @@ app.get("/", async (_req, res) => {
     }
   }
 
+  let demoTestRaw = null;
+  let demoTestDisplayError = null;
+  const redisUrl = getRedisUrl();
+  if (!redisUrl) {
+    demoTestDisplayError = "REDIS_URL not set";
+  } else if (!redisClient || redisInitError) {
+    demoTestDisplayError = redisInitError || "not connected";
+  } else {
+    try {
+      demoTestRaw = await redisClient.get(DEMO_TEST_KEY);
+    } catch (e) {
+      demoTestDisplayError = String(e?.message || e);
+    }
+  }
+
+  let demoTestFormatted = null;
+  if (demoTestRaw !== null) {
+    try {
+      demoTestFormatted = JSON.stringify(JSON.parse(demoTestRaw), null, 2);
+    } catch {
+      demoTestFormatted = null;
+    }
+  }
+
   const { appName: mongoAppName, error: mongoReadError } =
     await getAppNameFromMongo();
 
@@ -135,12 +196,16 @@ app.get("/", async (_req, res) => {
     ? mongoUri.replace(/:([^:@/]+)@/, ":****@")
     : "(not set)";
 
+  const redisMasked = redisUrl
+    ? redisUrl.replace(/:([^:@/]+)@/, ":****@")
+    : "(not set)";
+
   res.type("html").send(`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Demo lander — Deployer + Postgres + MongoDB</title>
+  <title>Demo lander — Deployer + Postgres + MongoDB + Redis</title>
   <style>
     :root { font-family: system-ui, sans-serif; background: #0f1419; color: #e7ecf3; }
     body { max-width: 42rem; margin: 3rem auto; padding: 0 1.25rem; line-height: 1.5; }
@@ -148,7 +213,7 @@ app.get("/", async (_req, res) => {
     .ok { color: #7ee787; }
     .bad { color: #ff7b72; }
     code, pre { font-size: 0.85rem; background: #1c2333; padding: 0.2em 0.45em; border-radius: 4px; }
-    pre { padding: 1rem; overflow-x: auto; }
+    pre { padding: 1rem; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
     a { color: #79c0ff; }
   </style>
 </head>
@@ -158,7 +223,7 @@ app.get("/", async (_req, res) => {
       ? escapeHtml(String(mongoAppName))
       : "Demo lander for Deployer"
   }</h1>
-  <p>This app is meant to be deployed with <strong>Deployer</strong>, with <strong>Postgres</strong> for visits and <strong>MongoDB</strong> for the displayed app name.</p>
+  <p>This app is meant to be deployed with <strong>Deployer</strong>, <strong>Postgres</strong> for visits, <strong>MongoDB</strong> for the headline app name, and <strong>Redis</strong> for the <code>demo_test</code> key.</p>
   <ul>
     <li>Compose file: <code>docker-compose.prod.yml</code></li>
     <li>App name (from MongoDB <code>app_meta</code>): ${
@@ -168,6 +233,14 @@ app.get("/", async (_req, res) => {
     }</li>
     <li>Postgres URL (masked): <code>${escapeHtml(masked)}</code></li>
     <li>MongoDB URI (masked): <code>${escapeHtml(mongoMasked)}</code></li>
+    <li>Redis URL (masked): <code>${escapeHtml(redisMasked)}</code></li>
+    <li><code>demo_test</code> (Redis, no TTL, set at startup): ${
+      demoTestRaw !== null
+        ? `<pre class="ok">${escapeHtml(
+            demoTestFormatted ?? demoTestRaw
+          )}</pre>`
+        : `<span class="bad">${escapeHtml(demoTestDisplayError)}</span>`
+    }</li>
     <li>Visit count (from Postgres): ${
       visitCount !== null
         ? `<span class="ok">${escapeHtml(String(visitCount))}</span>`
@@ -175,7 +248,7 @@ app.get("/", async (_req, res) => {
     }</li>
   </ul>
   <p>Each page load inserts a row into <code>visits</code>; refresh to see the count increase when Postgres is healthy. The headline reads <code>appName</code> from MongoDB (seeded on first connect; override with <code>APP_NAME</code> or edit the document).</p>
-  <p><a href="/health"><code>/health</code></a> — returns <code>ok</code> when every configured database initialized cleanly.</p>
+  <p><a href="/health"><code>/health</code></a> — returns <code>ok</code> when every configured database or cache initialized cleanly.</p>
 </body>
 </html>`);
 });
@@ -190,6 +263,7 @@ function escapeHtml(s) {
 
 await initDb();
 await initMongo();
+await initRedis();
 
 app.listen(port, "0.0.0.0", () => {
   console.log(`demo-lander listening on :${port}`);
