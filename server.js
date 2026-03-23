@@ -7,7 +7,7 @@ const app = express();
 const port = Number(process.env.PORT) || 3000;
 
 const APP_META_ID = "singleton";
-const DEMO_TEST_KEY = "demo_test";
+const DEMO_TEST_LOGICAL_KEY = "demo_test";
 const DEMO_TEST_JSON = '{"demo":"true"}';
 
 let pool = null;
@@ -30,6 +30,17 @@ function getMongoUri() {
 
 function getRedisUrl() {
   return process.env.REDIS_URL || null;
+}
+
+/** Namespace keys when sharing a Redis instance with other apps (optional). */
+function getRedisKeyPrefix() {
+  const p = (process.env.REDIS_KEY_PREFIX || "").trim();
+  return p.replace(/:+$/, "");
+}
+
+function redisKey(logicalKey) {
+  const p = getRedisKeyPrefix();
+  return p ? `${p}:${logicalKey}` : logicalKey;
 }
 
 async function initDb() {
@@ -119,7 +130,7 @@ async function initRedis() {
       console.error("Redis client error:", err);
     });
     await redisClient.connect();
-    await redisClient.set(DEMO_TEST_KEY, DEMO_TEST_JSON);
+    await redisClient.set(redisKey(DEMO_TEST_LOGICAL_KEY), DEMO_TEST_JSON);
     redisInitError = null;
   } catch (e) {
     redisInitError = String(e?.message || e);
@@ -168,7 +179,7 @@ app.get("/", async (_req, res) => {
     demoTestDisplayError = redisInitError || "not connected";
   } else {
     try {
-      demoTestRaw = await redisClient.get(DEMO_TEST_KEY);
+      demoTestRaw = await redisClient.get(redisKey(DEMO_TEST_LOGICAL_KEY));
     } catch (e) {
       demoTestDisplayError = String(e?.message || e);
     }
@@ -200,6 +211,9 @@ app.get("/", async (_req, res) => {
     ? redisUrl.replace(/:([^:@/]+)@/, ":****@")
     : "(not set)";
 
+  const redisKeyEffective = redisUrl ? redisKey(DEMO_TEST_LOGICAL_KEY) : null;
+  const redisPrefixDisplay = getRedisKeyPrefix() || "(none)";
+
   res.type("html").send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -223,7 +237,7 @@ app.get("/", async (_req, res) => {
       ? escapeHtml(String(mongoAppName))
       : "Demo lander for Deployer"
   }</h1>
-  <p>This app is meant to be deployed with <strong>Deployer</strong>, <strong>Postgres</strong> for visits, <strong>MongoDB</strong> for the headline app name, and <strong>Redis</strong> for the <code>demo_test</code> key.</p>
+  <p>This app is meant to be deployed with <strong>Deployer</strong>, <strong>Postgres</strong> for visits, <strong>MongoDB</strong> for the headline app name, and <strong>Redis</strong> for the <code>demo_test</code> value (key is namespaced with <code>REDIS_KEY_PREFIX</code> when set, for shared Redis).</p>
   <ul>
     <li>Compose file: <code>docker-compose.prod.yml</code></li>
     <li>App name (from MongoDB <code>app_meta</code>): ${
@@ -234,7 +248,8 @@ app.get("/", async (_req, res) => {
     <li>Postgres URL (masked): <code>${escapeHtml(masked)}</code></li>
     <li>MongoDB URI (masked): <code>${escapeHtml(mongoMasked)}</code></li>
     <li>Redis URL (masked): <code>${escapeHtml(redisMasked)}</code></li>
-    <li><code>demo_test</code> (Redis, no TTL, set at startup): ${
+    <li><code>REDIS_KEY_PREFIX</code>: <code>${escapeHtml(redisPrefixDisplay)}</code></li>
+    <li>Redis key <code>${escapeHtml(redisKeyEffective ?? DEMO_TEST_LOGICAL_KEY)}</code> (no TTL, set at startup): ${
       demoTestRaw !== null
         ? `<pre class="ok">${escapeHtml(
             demoTestFormatted ?? demoTestRaw
