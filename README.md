@@ -4,21 +4,21 @@ Minimal Node + Express app with **PostgreSQL** for end-to-end testing of Deploye
 
 ## Deployer setup
 
-1. Start the Deployer platform stack (Postgres must be running on `deployer_platform`).
-2. Register an app pointing at this repository, branch `main`, compose file `docker-compose.prod.yml`.
-3. Enable the **Postgres** backend for the app.
-4. Deploy. Deployer generates `.deployer.env` with `DATABASE_URL` and attaches your `web` service to `deployer_platform`.
+This repo’s `docker-compose.prod.yml` includes a **bundled Postgres** (`db`) plus **web**, same as local Docker.
 
-## Local Docker (optional)
+1. Register an app pointing at this repository, branch `main`, compose file `docker-compose.prod.yml`.
+2. Leave **MySQL / Postgres / Redis / Mongo** backends **off** for this app (the stack already provides its own database; enabling platform Postgres would merge conflicting `DATABASE_URL` behavior).
+3. Deploy. Compose brings up `db` and `web` on the default project network.
 
-With a Postgres URL:
+## Local Docker (with Postgres)
+
+`docker-compose.yml` only includes `docker-compose.prod.yml`, so local and prod compose stay identical.
 
 ```bash
-export DATABASE_URL=postgresql://user:pass@host:5432/dbname
-docker compose -f docker-compose.prod.yml up --build
+docker compose up -d --build
 ```
 
-Open http://localhost:3000 — the home page increments a `visits` counter in the database.
+Open http://localhost:3000 — each request inserts into `visits` and shows the total count. Stop with `docker compose down` (add `-v` to drop the database volume).
 
 ## Endpoints
 
