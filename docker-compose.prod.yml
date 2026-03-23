@@ -1,7 +1,28 @@
 services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: lander
+      POSTGRES_PASSWORD: lander
+      POSTGRES_DB: lander
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lander -d lander"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
   web:
     build: .
     ports:
       - "3000:3000"
     environment:
       PORT: "3000"
+      DATABASE_URL: postgresql://lander:lander@db:5432/lander
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
