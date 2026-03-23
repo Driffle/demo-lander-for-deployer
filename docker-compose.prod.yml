@@ -2,13 +2,13 @@ services:
   db:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: lander
-      POSTGRES_PASSWORD: lander
-      POSTGRES_DB: lander
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U lander -d lander"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 3s
       timeout: 3s
       retries: 15
@@ -25,8 +25,8 @@ services:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
       - miniodata:/data
     healthcheck:
@@ -39,38 +39,44 @@ services:
   mysql:
     image: mysql:8
     environment:
-      MYSQL_ROOT_PASSWORD: lander
-      MYSQL_DATABASE: lander
-      MYSQL_USER: lander
-      MYSQL_PASSWORD: lander
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
     volumes:
       - mysqldata:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-ulander", "-plander"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u${MYSQL_USER}", "-p${MYSQL_PASSWORD}"]
       interval: 3s
       timeout: 3s
       retries: 15
 
   web:
     build: .
+    # Load every key from `.env` into the container. The `environment` block below runs after
+    # this and overrides any duplicate names — so compose-defined values always win on clashes.
+    env_file:
+      - .env
     ports:
-      - "3000:3000"
+      - "${PORT:-3000}:3000"
     environment:
-      PORT: "3000"
-      DATABASE_URL: postgresql://lander:lander@db:5432/lander
-      MONGODB_URI: mongodb://mongo:27017/demo_lander
-      REDIS_URL: redis://redis:6379
-      REDIS_KEY_PREFIX: demo_lander
-      MYSQL_HOST: mysql
-      MYSQL_PORT: "3306"
-      MYSQL_DATABASE: lander
-      MYSQL_USER: lander
-      MYSQL_PASSWORD: lander
-      S3_ENDPOINT: http://minio:9000
-      S3_ACCESS_KEY_ID: minioadmin
-      S3_SECRET_ACCESS_KEY: minioadmin
-      S3_BUCKET: demo-uploads
-      S3_REGION: us-east-1
+      # Quote "${VAR}" so values with spaces (e.g. ENV_CUSTOM) are valid YAML after substitution.
+      PORT: "${PORT}"
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}"
+      MONGODB_URI: "${MONGODB_URI}"
+      REDIS_URL: "${REDIS_URL}"
+      REDIS_KEY_PREFIX: "${REDIS_KEY_PREFIX}"
+      MYSQL_HOST: "${MYSQL_HOST}"
+      MYSQL_PORT: "${MYSQL_PORT}"
+      MYSQL_DATABASE: "${MYSQL_DATABASE}"
+      MYSQL_USER: "${MYSQL_USER}"
+      MYSQL_PASSWORD: "${MYSQL_PASSWORD}"
+      S3_ENDPOINT: "${S3_ENDPOINT}"
+      S3_ACCESS_KEY_ID: "${S3_ACCESS_KEY_ID}"
+      S3_SECRET_ACCESS_KEY: "${S3_SECRET_ACCESS_KEY}"
+      S3_BUCKET: "${S3_BUCKET}"
+      S3_REGION: "${S3_REGION}"
+      ENV_CUSTOM: "${ENV_CUSTOM:-Hello World}"
     depends_on:
       db:
         condition: service_healthy
