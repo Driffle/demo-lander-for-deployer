@@ -51,6 +51,19 @@ services:
       timeout: 3s
       retries: 15
 
+  redis_demo_counter:
+    build: .
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: "${REDIS_URL}"
+      REDIS_KEY_PREFIX: "${REDIS_KEY_PREFIX}"
+    command: ["node", "scripts/redis-demo-counter.js"]
+    depends_on:
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
   web:
     build: .
     # Load every key from `.env` into the container. The `environment` block below runs after
