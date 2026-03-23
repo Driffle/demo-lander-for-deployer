@@ -41,6 +41,38 @@ let s3Client = null;
 let s3Bucket = null;
 let s3InitError = null;
 
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/** Mask secrets for HTML display (passwords, tokens, creds in URLs). */
+function maskEnvValueForDisplay(name, value) {
+  const v = String(value ?? "");
+  const n = name.toUpperCase();
+  const looksSecret =
+    /PASSWORD|PASSPHRASE|SECRET|TOKEN|PRIVATE|CREDENTIAL|API_KEY|SECRET_KEY|ACCESS_KEY|AUTH/i.test(
+      n,
+    ) && !/KEY_PREFIX|PREFIX|REDIS_KEY_PREFIX/i.test(n);
+  if (looksSecret) return "****";
+  if (/:([^:@/]+)@/.test(v)) return v.replace(/:([^:@/]+)@/, ":****@");
+  return v;
+}
+
+function buildProcessEnvTableHtml() {
+  const keys = Object.keys(process.env).sort((a, b) => a.localeCompare(b));
+  const rows = keys
+    .map((k) => {
+      const display = maskEnvValueForDisplay(k, process.env[k]);
+      return `<tr><td><code>${escapeHtml(k)}</code></td><td class="env-val"><code>${escapeHtml(display)}</code></td></tr>`;
+    })
+    .join("");
+  return rows;
+}
+
 function getDatabaseUrl() {
   return process.env.DATABASE_URL || null;
 }
@@ -53,8 +85,12 @@ function getRedisUrl() {
   return process.env.REDIS_URL || null;
 }
 
+/** Reads ENV_CUSTOM from the process environment (set by Docker / compose / Deployer). */
 function getEnvCustom() {
-  return process.env.ENV_CUSTOM ?? null;
+  const raw = process.env.ENV_CUSTOM;
+  if (raw === undefined || raw === null) return null;
+  const s = String(raw).trim();
+  return s.length === 0 ? null : s;
 }
 
 /** Namespace keys when sharing a Redis instance with other apps (optional). */
@@ -329,6 +365,14 @@ app.get("/health", (_req, res) => {
   res.type("text").send(healthOk() ? "ok" : "degraded");
 });
 
+/** Debug: verify Node sees ENV_CUSTOM (same value as shown on `/`). */
+app.get("/api/env-custom", (_req, res) => {
+  res.json({
+    ENV_CUSTOM: process.env.ENV_CUSTOM ?? null,
+    parsed: getEnvCustom(),
+  });
+});
+
 app.get("/api/counter", async (_req, res) => {
   const { value, error } = await getCounter();
   if (error) return res.status(503).json({ error });
@@ -495,7 +539,9 @@ app.get("/", async (_req, res) => {
   const redisPrefixDisplay = getRedisKeyPrefix() || "(none)";
 
   const envCustom = getEnvCustom();
+  const processEnvTableRows = buildProcessEnvTableHtml();
 
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate");
   res.type("html").send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -534,6 +580,14 @@ app.get("/", async (_req, res) => {
     .file-table a { text-decoration: none; }
     .btn-del { font-size: 0.75rem; padding: 0.2rem 0.5rem; }
     .env-custom-banner { margin: 0.75rem 0 1rem; padding: 0.75rem 1rem; background: #1c2333; border-radius: 8px; border-left: 4px solid #79c0ff; }
+    .env-vars-box { margin: 1.5rem 0; padding: 1rem 1.25rem; background: #1c2333; border-radius: 8px; }
+    .env-vars-box h2 { font-size: 1rem; font-weight: 600; margin: 0 0 0.5rem; }
+    .env-vars-box .hint { font-size: 0.8rem; opacity: 0.75; margin: 0 0 0.75rem; line-height: 1.4; }
+    .env-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    .env-table th { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #30363d; opacity: 0.75; font-weight: 500; }
+    .env-table td { padding: 0.35rem 0.5rem; border-bottom: 1px solid #252b36; vertical-align: top; }
+    .env-table td.env-val code { word-break: break-word; white-space: pre-wrap; }
+    .env-table tbody tr:hover { background: #252b36; }
   </style>
 </head>
 <body>
@@ -632,6 +686,17 @@ app.get("/", async (_req, res) => {
     ` : `<p class="bad">${escapeHtml(s3InitError || mongoInitError || "S3 or MongoDB not connected")}</p>`}
   </div>
 
+  <div class="env-vars-box">
+    <h2>Container environment <span style="opacity:0.5">(process.env)</span></h2>
+    <p class="hint">All variables visible to this Node process (${escapeHtml(String(Object.keys(process.env).length))} total). Values that look like passwords, API keys, or credentials in URLs are masked for safe display in the browser.</p>
+    <div style="overflow-x:auto">
+      <table class="env-table">
+        <thead><tr><th>Name</th><th>Value</th></tr></thead>
+        <tbody>${processEnvTableRows}</tbody>
+      </table>
+    </div>
+  </div>
+
   <ul>
     <li>Compose file: <code>docker-compose.prod.yml</code></li>
     <li><code>ENV_CUSTOM</code>: ${
@@ -677,14 +742,6 @@ app.get("/", async (_req, res) => {
 </body>
 </html>`);
 });
-
-function escapeHtml(s) {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
 
 await initDb();
 await initMongo();
