@@ -21,6 +21,21 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
 
+  mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: lander
+      MYSQL_DATABASE: lander
+      MYSQL_USER: lander
+      MYSQL_PASSWORD: lander
+    volumes:
+      - mysqldata:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-ulander", "-plander"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
   web:
     build: .
     ports:
@@ -31,6 +46,11 @@ services:
       MONGODB_URI: mongodb://mongo:27017/demo_lander
       REDIS_URL: redis://redis:6379
       REDIS_KEY_PREFIX: demo_lander
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_DATABASE: lander
+      MYSQL_USER: lander
+      MYSQL_PASSWORD: lander
     depends_on:
       db:
         condition: service_healthy
@@ -38,6 +58,9 @@ services:
         condition: service_started
       redis:
         condition: service_started
+      mysql:
+        condition: service_healthy
 
 volumes:
   pgdata:
+  mysqldata:

@@ -1,14 +1,17 @@
 import express from "express";
 import { MongoClient } from "mongodb";
+import mysql from "mysql2/promise";
 import pg from "pg";
 import { createClient } from "redis";
 
 const app = express();
+app.use(express.json());
 const port = Number(process.env.PORT) || 3000;
 
 const APP_META_ID = "singleton";
 const DEMO_TEST_LOGICAL_KEY = "demo_test";
 const DEMO_TEST_JSON = '{"demo":"true"}';
+const COUNTER_NAME = "main";
 
 let pool = null;
 let dbError = null;
@@ -19,6 +22,9 @@ let mongoInitError = null;
 
 let redisClient = null;
 let redisInitError = null;
+
+let mysqlPool = null;
+let mysqlInitError = null;
 
 function getDatabaseUrl() {
   return process.env.DATABASE_URL || null;
@@ -143,18 +149,139 @@ async function initRedis() {
   }
 }
 
+function getMysqlConfig() {
+  const host = process.env.MYSQL_HOST || null;
+  if (!host) return null;
+  return {
+    host,
+    port: Number(process.env.MYSQL_PORT) || 3306,
+    database: process.env.MYSQL_DATABASE || "lander",
+    user: process.env.MYSQL_USER || "root",
+    password: process.env.MYSQL_PASSWORD || "",
+  };
+}
+
+async function initMysql() {
+  const cfg = getMysqlConfig();
+  if (!cfg) {
+    mysqlInitError =
+      "MYSQL_HOST is not set (expected when running under Deployer with MySQL enabled).";
+    return;
+  }
+  try {
+    mysqlPool = mysql.createPool({ ...cfg, waitForConnections: true, connectionLimit: 5 });
+    await mysqlPool.execute(`
+      CREATE TABLE IF NOT EXISTS counters (
+        name VARCHAR(255) NOT NULL PRIMARY KEY,
+        value BIGINT NOT NULL DEFAULT 0
+      )
+    `);
+    const [rows] = await mysqlPool.execute(
+      "SELECT 1 FROM counters WHERE name = ?",
+      [COUNTER_NAME],
+    );
+    if (/** @type {any[]} */ (rows).length === 0) {
+      await mysqlPool.execute(
+        "INSERT IGNORE INTO counters (name, value) VALUES (?, 0)",
+        [COUNTER_NAME],
+      );
+    }
+    mysqlInitError = null;
+  } catch (e) {
+    mysqlInitError = String(e?.message || e);
+    mysqlPool = null;
+  }
+}
+
+async function getCounter() {
+  if (!mysqlPool) return { value: null, error: mysqlInitError };
+  try {
+    const [rows] = await mysqlPool.execute(
+      "SELECT value FROM counters WHERE name = ?",
+      [COUNTER_NAME],
+    );
+    const r = /** @type {any[]} */ (rows);
+    return { value: r.length ? Number(r[0].value) : 0, error: null };
+  } catch (e) {
+    return { value: null, error: String(e?.message || e) };
+  }
+}
+
+async function changeCounter(delta) {
+  if (!mysqlPool) return { value: null, error: mysqlInitError || "MySQL not connected" };
+  const conn = await mysqlPool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.execute(
+      "UPDATE counters SET value = value + ? WHERE name = ?",
+      [delta, COUNTER_NAME],
+    );
+    const [rows] = await conn.execute(
+      "SELECT value FROM counters WHERE name = ?",
+      [COUNTER_NAME],
+    );
+    await conn.commit();
+    const r = /** @type {any[]} */ (rows);
+    return { value: r.length ? Number(r[0].value) : 0, error: null };
+  } catch (e) {
+    await conn.rollback();
+    return { value: null, error: String(e?.message || e) };
+  } finally {
+    conn.release();
+  }
+}
+
+async function resetCounter() {
+  if (!mysqlPool) return { value: null, error: mysqlInitError || "MySQL not connected" };
+  try {
+    await mysqlPool.execute(
+      "UPDATE counters SET value = 0 WHERE name = ?",
+      [COUNTER_NAME],
+    );
+    return { value: 0, error: null };
+  } catch (e) {
+    return { value: null, error: String(e?.message || e) };
+  }
+}
+
 function healthOk() {
   const pgNeeded = Boolean(getDatabaseUrl());
   const mongoNeeded = Boolean(getMongoUri());
   const redisNeeded = Boolean(getRedisUrl());
+  const mysqlNeeded = Boolean(getMysqlConfig());
   if (pgNeeded && dbError) return false;
   if (mongoNeeded && mongoInitError) return false;
   if (redisNeeded && redisInitError) return false;
+  if (mysqlNeeded && mysqlInitError) return false;
   return true;
 }
 
 app.get("/health", (_req, res) => {
   res.type("text").send(healthOk() ? "ok" : "degraded");
+});
+
+app.get("/api/counter", async (_req, res) => {
+  const { value, error } = await getCounter();
+  if (error) return res.status(503).json({ error });
+  res.json({ value });
+});
+
+app.post("/api/counter/increment", async (_req, res) => {
+  const { value, error } = await changeCounter(1);
+  if (error) return res.status(503).json({ error });
+  res.json({ value });
+});
+
+app.post("/api/counter/decrement", async (_req, res) => {
+  const { value, error } = await changeCounter(-1);
+  if (error) return res.status(503).json({ error });
+  res.json({ value });
+});
+
+app.post("/api/counter/reset", async (_req, res) => {
+  const { value, error } = await resetCounter();
+  if (error) return res.status(503).json({ error });
+  res.json({ value });
 });
 
 app.get("/", async (_req, res) => {
@@ -194,8 +321,15 @@ app.get("/", async (_req, res) => {
     }
   }
 
+  const { value: counterValue, error: counterError } = await getCounter();
+
   const { appName: mongoAppName, error: mongoReadError } =
     await getAppNameFromMongo();
+
+  const mysqlCfg = getMysqlConfig();
+  const mysqlMasked = mysqlCfg
+    ? `mysql://${mysqlCfg.user}:****@${mysqlCfg.host}:${mysqlCfg.port}/${mysqlCfg.database}`
+    : "(not set)";
 
   const url = getDatabaseUrl();
   const masked = url
@@ -219,7 +353,7 @@ app.get("/", async (_req, res) => {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Demo lander — Deployer + Postgres + MongoDB + Redis</title>
+  <title>Demo lander — Deployer + Postgres + MongoDB + Redis + MySQL</title>
   <style>
     :root { font-family: system-ui, sans-serif; background: #0f1419; color: #e7ecf3; }
     body { max-width: 42rem; margin: 3rem auto; padding: 0 1.25rem; line-height: 1.5; }
@@ -229,6 +363,18 @@ app.get("/", async (_req, res) => {
     code, pre { font-size: 0.85rem; background: #1c2333; padding: 0.2em 0.45em; border-radius: 4px; }
     pre { padding: 1rem; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
     a { color: #79c0ff; }
+    .counter-box { margin: 1.5rem 0; padding: 1.25rem; background: #1c2333; border-radius: 8px; text-align: center; }
+    .counter-value { font-size: 2.5rem; font-weight: 700; font-variant-numeric: tabular-nums; margin: 0.5rem 0; }
+    .counter-buttons { display: flex; gap: 0.5rem; justify-content: center; margin-top: 0.75rem; }
+    .counter-buttons button {
+      font-size: 0.9rem; font-weight: 600; padding: 0.4rem 1rem; border: none;
+      border-radius: 6px; cursor: pointer; transition: opacity 0.15s;
+    }
+    .counter-buttons button:hover { opacity: 0.85; }
+    .counter-buttons button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-inc { background: #238636; color: #fff; }
+    .btn-dec { background: #da3633; color: #fff; }
+    .btn-reset { background: #30363d; color: #c9d1d9; }
   </style>
 </head>
 <body>
@@ -237,7 +383,33 @@ app.get("/", async (_req, res) => {
       ? escapeHtml(String(mongoAppName))
       : "Demo lander for Deployer"
   }</h1>
-  <p>This app is meant to be deployed with <strong>Deployer</strong>, <strong>Postgres</strong> for visits, <strong>MongoDB</strong> for the headline app name, and <strong>Redis</strong> for the <code>demo_test</code> value (key is namespaced with <code>REDIS_KEY_PREFIX</code> when set, for shared Redis).</p>
+  <p>This app is meant to be deployed with <strong>Deployer</strong>, <strong>Postgres</strong> for visits, <strong>MongoDB</strong> for the headline app name, <strong>Redis</strong> for the <code>demo_test</code> value, and <strong>MySQL</strong> for the atomic counter.</p>
+
+  <div class="counter-box">
+    <div style="font-size:0.85rem;opacity:0.7;text-transform:uppercase;letter-spacing:0.05em">Atomic Counter <span style="opacity:0.5">(MySQL)</span></div>
+    ${
+      counterValue !== null
+        ? `<div class="counter-value ok" id="counter-value">${escapeHtml(String(counterValue))}</div>`
+        : `<div class="counter-value bad" id="counter-value">${escapeHtml(counterError || "not connected")}</div>`
+    }
+    <div class="counter-buttons">
+      <button class="btn-dec" onclick="counterAction('decrement')" ${counterValue === null ? "disabled" : ""}>&#x2212; Decrement</button>
+      <button class="btn-reset" onclick="counterAction('reset')" ${counterValue === null ? "disabled" : ""}>Reset</button>
+      <button class="btn-inc" onclick="counterAction('increment')" ${counterValue === null ? "disabled" : ""}>+ Increment</button>
+    </div>
+  </div>
+  <script>
+    async function counterAction(action) {
+      try {
+        const r = await fetch('/api/counter/' + action, { method: 'POST' });
+        const d = await r.json();
+        const el = document.getElementById('counter-value');
+        if (d.error) { el.textContent = d.error; el.className = 'counter-value bad'; }
+        else { el.textContent = d.value; el.className = 'counter-value ok'; }
+      } catch (e) { console.error(e); }
+    }
+  </script>
+
   <ul>
     <li>Compose file: <code>docker-compose.prod.yml</code></li>
     <li>App name (from MongoDB <code>app_meta</code>): ${
@@ -249,6 +421,7 @@ app.get("/", async (_req, res) => {
     <li>MongoDB URI (masked): <code>${escapeHtml(mongoMasked)}</code></li>
     <li>Redis URL (masked): <code>${escapeHtml(redisMasked)}</code></li>
     <li><code>REDIS_KEY_PREFIX</code>: <code>${escapeHtml(redisPrefixDisplay)}</code></li>
+    <li>MySQL (masked): <code>${escapeHtml(mysqlMasked)}</code></li>
     <li>Redis key <code>${escapeHtml(redisKeyEffective ?? DEMO_TEST_LOGICAL_KEY)}</code> (no TTL, set at startup): ${
       demoTestRaw !== null
         ? `<pre class="ok">${escapeHtml(
@@ -261,8 +434,13 @@ app.get("/", async (_req, res) => {
         ? `<span class="ok">${escapeHtml(String(visitCount))}</span>`
         : `<span class="bad">${lastPgError ? escapeHtml(lastPgError) : "not connected"}</span>`
     }</li>
+    <li>Atomic counter (from MySQL): ${
+      counterValue !== null
+        ? `<span class="ok">${escapeHtml(String(counterValue))}</span>`
+        : `<span class="bad">${counterError ? escapeHtml(counterError) : "not connected"}</span>`
+    }</li>
   </ul>
-  <p>Each page load inserts a row into <code>visits</code>; refresh to see the count increase when Postgres is healthy. The headline reads <code>appName</code> from MongoDB (seeded on first connect; override with <code>APP_NAME</code> or edit the document).</p>
+  <p>Each page load inserts a row into <code>visits</code>; refresh to see the count increase when Postgres is healthy. The headline reads <code>appName</code> from MongoDB (seeded on first connect; override with <code>APP_NAME</code> or edit the document). Use the counter buttons above to test atomic MySQL operations.</p>
   <p><a href="/health"><code>/health</code></a> — returns <code>ok</code> when every configured database or cache initialized cleanly.</p>
 </body>
 </html>`);
@@ -279,6 +457,7 @@ function escapeHtml(s) {
 await initDb();
 await initMongo();
 await initRedis();
+await initMysql();
 
 app.listen(port, "0.0.0.0", () => {
   console.log(`demo-lander listening on :${port}`);
