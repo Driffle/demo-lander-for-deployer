@@ -4,11 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js",
+    "start": "node --import @opentelemetry/auto-instrumentations-node/register server.js",
     "redis-counter": "node scripts/redis-demo-counter.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.750.0",
+    "@opentelemetry/auto-instrumentations-node": "^0.71.0",
     "express": "^4.21.2",
     "mongodb": "^6.21.0",
     "multer": "^2.1.1",

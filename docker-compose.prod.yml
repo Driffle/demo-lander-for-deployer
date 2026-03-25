@@ -58,6 +58,10 @@ services:
     environment:
       REDIS_URL: "${REDIS_URL}"
       REDIS_KEY_PREFIX: "${REDIS_KEY_PREFIX}"
+      OTEL_METRICS_EXPORTER: "none"
+      OTEL_TRACES_EXPORTER: "none"
+      OTEL_LOGS_EXPORTER: "none"
+    # Intentionally no --import: this sidecar does not load OTel; exporters are off above.
     command: ["node", "scripts/redis-demo-counter.js"]
     depends_on:
       redis:
@@ -90,6 +94,13 @@ services:
       S3_BUCKET: "${S3_BUCKET}"
       S3_REGION: "${S3_REGION}"
       ENV_CUSTOM: "${ENV_CUSTOM:-Hello World}"
+      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-demo-lander}"
+      OTEL_METRICS_EXPORTER: "${OTEL_METRICS_EXPORTER:-none}"
+      OTEL_TRACES_EXPORTER: "${OTEL_TRACES_EXPORTER:-none}"
+      OTEL_LOGS_EXPORTER: "${OTEL_LOGS_EXPORTER:-none}"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}"
+      # Omit OTEL_EXPORTER_OTLP_ENDPOINT here so it is unset unless provided via .env (empty compose
+      # substitution would override with "" and break OTLP when metrics exporter is otlp).
     depends_on:
       db:
         condition: service_healthy
